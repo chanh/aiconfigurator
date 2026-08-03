@@ -43,6 +43,37 @@ _AUTOSCALE_TTFT_CORRECTION_FACTOR = 1.8
 # ---------------------------------------------------------------------------
 
 
+def _kv_transfer_latency_ms(
+    isl: int,
+    kv_bytes_per_token: float,
+    fabric_bandwidth_GBps: float,
+    kv_hit_rate: float,
+) -> float:
+    """Prefill->decode KV-cache transfer latency in ms for one request.
+
+    In P/D disaggregation the prefill worker's KV cache for the uncached tokens
+    must be moved to the decode worker over the east-west fabric before decode
+    can start. This is the ``p_storage_d_network`` data path in
+    ai-dynamo/dynamo#10863. Only the uncached ``isl * (1 - kv_hit_rate)`` tokens
+    are transferred (a warm prefix hit is already resident / not re-sent).
+
+    ``kv_bytes_per_token`` is the wire size of one token's KV cache across all
+    attention layers, in bytes. For a hybrid-attention model the caller derives
+    it in a window-aware way (only the global layers grow with sequence length;
+    sliding-window layers cap at the window), so this term stays linear in the
+    transferred token count.
+
+    Returns 0.0 when the feature is off (either input non-positive), which keeps
+    the disagg row bit-identical to the pre-feature behaviour.
+    """
+    if fabric_bandwidth_GBps <= 0.0 or kv_bytes_per_token <= 0.0:
+        return 0.0
+    transferred_tokens = max(isl, 0) * max(1.0 - kv_hit_rate, 0.0)
+    transfer_bytes = kv_bytes_per_token * transferred_tokens
+    # GB/s == 1e9 bytes/s -> seconds; *1e3 -> ms.
+    return transfer_bytes / (fabric_bandwidth_GBps * 1e9) * 1e3
+
+
 def _build_disagg_summary_dict(
     prefill_summary_dict: dict,
     prefill_num_worker: int,
@@ -50,6 +81,10 @@ def _build_disagg_summary_dict(
     decode_num_worker: int,
     prefill_degradation_factor: float = _RATE_MATCHING_PREFILL_DEGRADATION_FACTOR,
     decode_degradation_factor: float = _RATE_MATCHING_DECODE_DEGRADATION_FACTOR,
+    *,
+    fabric_bandwidth_GBps: float = 0.0,
+    kv_bytes_per_token: float = 0.0,
+    kv_hit_rate: float = 0.0,
 ) -> dict:
     """Build a disagg summary row from independent prefill and decode dicts.
 
@@ -66,12 +101,36 @@ def _build_disagg_summary_dict(
             throughput during rate matching (default 0.9).
         decode_degradation_factor: Multiplicative degradation for decode
             throughput during rate matching (default 0.92).
+        fabric_bandwidth_GBps: East-west (P->D) fabric bandwidth in GB/s for the
+            KV-cache handoff. ``0`` (default) disables the transfer model and
+            leaves the row identical to before.
+        kv_bytes_per_token: Wire size of one token's KV cache across all
+            attention layers, in bytes (caller-derived; hybrid-attention aware).
+            ``0`` (default) disables the transfer model.
+        kv_hit_rate: Prefix-cache hit fraction (0-1). Cached tokens are already
+            resident on decode and are not re-transferred, so only
+            ``isl * (1 - kv_hit_rate)`` tokens cross the fabric.
 
     Returns:
         Dict with keys matching ``common.ColumnsDisagg``.
     """
+    # Prefill->decode KV handoff. When enabled it (a) lengthens the prefill
+    # critical path (added to TTFT / request_latency) and (b) occupies the
+    # prefill worker for longer, lowering its effective seq/s in rate matching.
+    transfer_ms = _kv_transfer_latency_ms(
+        int(prefill_summary_dict["isl"]),
+        kv_bytes_per_token,
+        fabric_bandwidth_GBps,
+        kv_hit_rate,
+    )
+    prefill_ttft = prefill_summary_dict["ttft"]
+    prefill_service_ms = prefill_ttft + transfer_ms
+    effective_prefill_seq_s = prefill_summary_dict["seq/s"]
+    if transfer_ms > 0.0 and prefill_service_ms > 0.0:
+        effective_prefill_seq_s = effective_prefill_seq_s * prefill_ttft / prefill_service_ms
+
     seq_s = min(
-        prefill_summary_dict["seq/s"] * prefill_num_worker * prefill_degradation_factor,
+        effective_prefill_seq_s * prefill_num_worker * prefill_degradation_factor,
         decode_summary_dict["seq/s"] * decode_num_worker * decode_degradation_factor,
     )
     prefill_gpus = prefill_summary_dict["pp"] * prefill_summary_dict["tp"] * prefill_summary_dict["dp"]
@@ -84,11 +143,12 @@ def _build_disagg_summary_dict(
     tokens_s_gpu = tokens_s / num_total_gpus if num_total_gpus > 0 else 0.0
     encoder_latency = float(prefill_summary_dict.get("encoder_latency", 0.0))
     encoder_memory = float(prefill_summary_dict.get("encoder_memory", 0.0))
-    # static_ctx ttft already includes colocated encoder latency.
-    request_latency = prefill_summary_dict["ttft"] + decode_summary_dict["tpot"] * max(osl - 1, 0)
+    # static_ctx ttft already includes colocated encoder latency; the KV handoff
+    # adds to the prefill critical path before decode can begin.
+    ttft = prefill_ttft + transfer_ms
+    request_latency = ttft + decode_summary_dict["tpot"] * max(osl - 1, 0)
 
     # Weighted average power
-    ttft = prefill_summary_dict["ttft"]
     tpot = decode_summary_dict["tpot"]
     decode_time = tpot * max(osl - 1, 0)
     prefill_power = prefill_summary_dict.get("power_w", 0.0)
